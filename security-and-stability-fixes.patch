@@ -1,0 +1,881 @@
+diff --git a/GrimDawnModMerger/GrimDawnModMerger/CommandLine.cs b/GrimDawnModMerger/GrimDawnModMerger/CommandLine.cs
+index 7990cda..00322d2 100644
+--- a/GrimDawnModMerger/GrimDawnModMerger/CommandLine.cs
++++ b/GrimDawnModMerger/GrimDawnModMerger/CommandLine.cs
+@@ -3,234 +3,280 @@ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+ using System.IO;
+-using System.IO.Enumeration;
+-using System.Text;
+ using System.Threading;
+-using System.Windows;
+-using System.Windows.Threading;
+ 
+ namespace GrimDawnModMerger
+ {
+-    public class CommandLine // TODO make singleton
++    /// <summary>
++    /// Runs ArchiveTool / arzedit one command at a time on a background thread.
++    /// Tools are started directly (no cmd.exe) with an argument list, so no user-controlled
++    /// text is ever interpreted by a shell.
++    /// </summary>
++    public class CommandLine
+     {
+         public BlockingCollection<Message> messageQueue;
+         public event EventHandler<UILogMessageEventArgs> UILogMessageEvent;
+ 
+-        private Process cmd;
++        private readonly string gameDir;
+         private Thread cmdThread;
+-        private string gameDir;
+-        private bool threadRunning = false; // is this still needed?
++        private volatile bool cancelled;
++        private Process currentProcess;
++        private readonly object processLock = new object();
+ 
+-        private HashSet<string> files;
+-        private int overwrittenFiles; // sort of placeholder
++        private readonly HashSet<string> files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
++        private readonly List<string> overwrittenNames = new List<string>();
++        private readonly object trackLock = new object();
++        private int errorCount;
+ 
+         public CommandLine(string gameDir, EventHandler<UILogMessageEventArgs> eventHandler)
+         {
+             this.gameDir = gameDir;
+             messageQueue = new BlockingCollection<Message>(new ConcurrentQueue<Message>());
+             UILogMessageEvent += eventHandler;
+-            files = new HashSet<string>();
+-            overwrittenFiles = 0;
+         }
+ 
+         public void Start()
+         {
+-            overwrittenFiles = 0;
++            errorCount = 0;
+             cmdThread = new Thread(ThreadLoop);
+             cmdThread.IsBackground = true;
+             cmdThread.Start();
+         }
+ 
+-        public void Kill(bool gracefully = true) // somewhat tested. None-graceful seems to work...
++        /// <summary>
++        /// gracefully: finish everything already queued, then stop.
++        /// not gracefully: kill the running tool, skip anything still queued, then stop.
++        /// </summary>
++        public void Kill(bool gracefully = true)
+         {
+-            if (gracefully)
+-                messageQueue.Add(new Message { Command = "Close", Args = null });
+-            else
+-            {
+-                cmd.Kill();
+-                Trace.WriteLine("cmd is kill");
+-            }
+-            
+-            // kill archivetool if it is still running
+-            foreach (Process proc in Process.GetProcessesByName("ArchiveTool"))
++            if (!gracefully)
+             {
+-                Trace.WriteLine("Killing archivetool...");
+-                proc.Kill();
++                cancelled = true;
++                lock (processLock)
++                {
++                    try
++                    {
++                        if (currentProcess != null && !currentProcess.HasExited)
++                            currentProcess.Kill(true);
++                    }
++                    catch (InvalidOperationException) { /* already exited */ }
++                }
+             }
++
++            messageQueue.Add(new Message { Command = "Close", Args = null });
+         }
+ 
+         public void ThreadLoop()
+         {
+-            threadRunning = true;
+-            cmd = new Process();
+-            cmd.StartInfo.FileName = "cmd.exe";
+-            cmd.StartInfo.RedirectStandardInput = true;
+-            cmd.StartInfo.RedirectStandardOutput = true;
+-            cmd.StartInfo.CreateNoWindow = true;
+-            cmd.StartInfo.UseShellExecute = false;
+-            cmd.Start();
+-
+-            cmd.BeginOutputReadLine();
+-            //int skippedCount = 0;
+-            cmd.OutputDataReceived += (sender, args) =>
+-            {
+-                if (args.Data == null)
+-                    return;
+-                // message culling test, looks a bit confusing tbh
+-                /*
+-               if (args.Data.Length > 2 && (args.Data[0] == '(' || (args.Data[0] == 'a' && args.Data[1] == 'd')))
+-               {
+-                   skippedCount++;
+-                   if (skippedCount > 10)
+-                   {
+-                       SendToUI(args.Data);
+-                       skippedCount = 0;
+-                   }
+-               }
+-               else
+-               {
+-                   SendToUI(args.Data);
+-               }
+-                */
+-
+-                TrackFile(args.Data);
+-
+-                SendToUI(args.Data);
+-                //Trace.WriteLine(args.Data);
+-            };
+-            cmd.ErrorDataReceived += (sender, args) =>
+-            {
+-                if (args.Data != null)
+-                    SendToUI(args.Data);
+-                //Trace.WriteLine(args.Data);
+-            };
+-
+-            cmd.StandardInput.WriteLine("cd \"" + gameDir + "\"");
+-            cmd.StandardInput.FlushAsync();
+-            cmd.StandardInput.WriteLine("echo Test Test Test");
+-            cmd.StandardInput.FlushAsync();
+-
+             Trace.WriteLine("Thread " + Thread.CurrentThread.ManagedThreadId + " running...");
+-            while (threadRunning)
++            while (true)
+             {
+                 Message message = messageQueue.Take();
+-                switch (message.Command)
++                if (message.Command == "Close")
++                    break;
++                if (cancelled)
++                    continue; // drain the queue without running anything
++
++                try
++                {
++                    switch (message.Command)
++                    {
++                        case "Extract":
++                            Extract(message.Args[0], message.Args[1]);
++                            break;
++                        case "ExtractDatabase":
++                            ExtractDatabase(message.Args[0], message.Args[1]);
++                            break;
++                        case "Pack":
++                            Pack(message.Args[0], message.Args[1], message.Args[2]);
++                            break;
++                        case "BuildDatabase":
++                            BuildDatabase(message.Args[0], message.Args[1]);
++                            break;
++                    }
++                }
++                catch (Exception e)
+                 {
+-                    case "Close":
+-                        Trace.WriteLine("Closing..");
+-                        threadRunning = false;
+-                        Close();
+-                        return;
+-
+-                    case "Extract":
+-                        Extract(message.Args[0], message.Args[1]);
+-                        break;
+-
+-                    case "ExtractDatabase":
+-                        ExtractDatabase(message.Args[0], message.Args[1]);
+-                        break;
+-
+-                    case "Pack":
+-                        Pack(message.Args[0], message.Args[1], message.Args[2]);
+-                        break;
+-
+-                    case "BuildDatabase":
+-                        BuildDatabase(message.Args[0], message.Args[1]);
+-                        break;
++                    errorCount++;
++                    SendToUI("ERROR running " + message.Command + ": " + e.Message);
+                 }
+             }
+ 
+             Close();
+         }
+ 
+-        public void Extract(string from, string to)
++        private string ArchiveToolPath
+         {
+-            cmd.StandardInput.WriteLine(".\\archivetool \"" + from + "\" -extract \"" + to + "\"");
+-            cmd.StandardInput.Flush();
++            get { return Path.Combine(gameDir, "ArchiveTool.exe"); }
+         }
+ 
+-        public void ExtractDatabase (string from, string to)
++        private string FindArzEdit()
+         {
+-            cmd.StandardInput.WriteLine(".\\archivetool \"" + from + "\" -database \"" + to + "\"");
+-            cmd.StandardInput.Flush();
++            string[] candidates =
++            {
++                Path.Combine(AppContext.BaseDirectory, "arzedit.exe"),
++                Path.Combine(Directory.GetCurrentDirectory(), "arzedit.exe")
++            };
++            foreach (string c in candidates)
++                if (File.Exists(c))
++                    return c;
++            return candidates[0]; // reported as "not found" by RunTool
+         }
+ 
+-        public void Pack(string parentDir, string dir, string to)
++        public void Extract(string from, string to)
+         {
+-            cmd.StandardInput.WriteLine(".\\archivetool \"" + @to + "\" -update " + "." + " \"" + @parentDir + "\" 6");
+-            cmd.StandardInput.Flush();
++            RunTool(ArchiveToolPath, from, "-extract", to);
+         }
+ 
+-        public void BuildDatabase(string modDir, string gameDir)
++        public void ExtractDatabase(string from, string to)
+         {
+-            cmd.StandardInput.WriteLine(Directory.GetCurrentDirectory() + "\\arzedit build \"" + modDir + "\" \"" + modDir + "\" -g \"" + gameDir + "\" -t \"" + modDir + "\\database\\templates\" -A -R");
+-
+-            cmd.StandardInput.Flush();
++            RunTool(ArchiveToolPath, from, "-database", to);
+         }
+ 
+-        public void Close()
++        public void Pack(string parentDir, string dir, string to)
+         {
+-            cmd.StandardInput.Close();
+-            cmd.WaitForExit();
+-            if (overwrittenFiles > 0)
+-                SendToUI("\n\nWARNING: Overwrote " + overwrittenFiles + " files");
+-            SendToUI("\n<---- Merge Complete ---->");
+-            Trace.WriteLine("cmd closed");
++            RunTool(ArchiveToolPath, to, "-update", ".", parentDir, "6");
+         }
+ 
+-        private void SendToUI(string message)
++        public void BuildDatabase(string modDir, string gameDir)
+         {
+-            UILogMessageEvent.Invoke(this, new UILogMessageEventArgs {Message = message});
++            RunTool(FindArzEdit(), "build", modDir, modDir,
++                    "-g", gameDir,
++                    "-t", Path.Combine(modDir, "database", "templates"),
++                    "-A", "-R");
+         }
+ 
+-        private void TrackFile(string data)
++        private void RunTool(string exePath, params string[] args)
+         {
+-            if (data.Length < 5)
++            if (!File.Exists(exePath))
++            {
++                errorCount++;
++                SendToUI("ERROR: tool not found: " + exePath);
+                 return;
++            }
+ 
+-            // detect extraction
+-            if (data[0] == '(')
++            var psi = new ProcessStartInfo
++            {
++                FileName = exePath,
++                WorkingDirectory = gameDir,
++                UseShellExecute = false,
++                CreateNoWindow = true,
++                RedirectStandardOutput = true,
++                RedirectStandardError = true
++            };
++            foreach (string a in args)
++                psi.ArgumentList.Add(a);
++
++            using (var p = new Process { StartInfo = psi })
+             {
+-                int s = 0;
+-                for (int i = 0; i < data.Length; i++)
++                p.OutputDataReceived += (sender, e) =>
+                 {
+-                    if (data[i] == ')')
+-                    {
+-                        s = i + 2;
+-                        if (data.Contains("Extracting "))
+-                            s += 11;
+-                        break;
+-                    }
++                    if (e.Data == null) return;
++                    TrackFile(e.Data);
++                    SendToUI(e.Data);
++                };
++                p.ErrorDataReceived += (sender, e) =>
++                {
++                    if (e.Data != null) SendToUI(e.Data);
++                };
++
++                lock (processLock)
++                {
++                    if (cancelled) return;
++                    p.Start();
++                    currentProcess = p;
+                 }
+-                string fileName = data.Substring(s);
+-                if (files.Contains(fileName))
++
++                p.BeginOutputReadLine();
++                p.BeginErrorReadLine();
++                p.WaitForExit();
++
++                lock (processLock)
+                 {
+-                    overwrittenFiles++;
+-                    Trace.WriteLine("overwriting " + fileName);
++                    currentProcess = null;
+                 }
+-                else
++
++                if (!cancelled && p.ExitCode != 0)
+                 {
+-                    files.Add(fileName);
++                    errorCount++;
++                    SendToUI("ERROR: " + Path.GetFileName(exePath) + " exited with code " + p.ExitCode);
+                 }
+-                //Trace.WriteLine(filename);
+             }
++        }
+ 
+-            // detect addition
+-            if (data.Contains("added: "))
++        public void Close()
++        {
++            lock (trackLock)
+             {
+-                int s = 7;
+-                string fileName = data.Substring(s);
+-                if (files.Contains(fileName))
++                if (overwrittenNames.Count > 0)
+                 {
+-                    overwrittenFiles++;
++                    SendToUI("\n\nWARNING: " + overwrittenNames.Count + " archive file(s) were overwritten by a later mod (the later mod wins):");
++                    int shown = 0;
++                    foreach (string n in overwrittenNames)
++                    {
++                        if (shown++ >= 50) break;
++                        SendToUI("  " + n);
++                    }
++                    if (overwrittenNames.Count > 50)
++                        SendToUI("  ... and " + (overwrittenNames.Count - 50) + " more");
++                }
++            }
++
++            if (errorCount > 0)
++            {
++                SendToUI("\nWARNING: " + errorCount + " error(s) occurred - check the log above. The merged mod may be incomplete.");
++                SendToUI("\n<---- Merge Complete (with errors) ---->");
++            }
++            else
++            {
++                SendToUI("\n<---- Merge Complete ---->");
++            }
++            Trace.WriteLine("merge thread finished");
++        }
++
++        private void SendToUI(string message)
++        {
++            UILogMessageEvent?.Invoke(this, new UILogMessageEventArgs { Message = message });
++        }
++
++        private void RecordFile(string fileName)
++        {
++            if (string.IsNullOrWhiteSpace(fileName))
++                return;
++
++            lock (trackLock)
++            {
++                if (!files.Add(fileName))
++                {
++                    overwrittenNames.Add(fileName);
+                     Trace.WriteLine("overwriting " + fileName);
+                 }
+-                else
++            }
++        }
++
++        private void TrackFile(string data)
++        {
++            if (data.Length < 5)
++                return;
++
++            // detect extraction, e.g. "(12/340) Extracting records/foo.dbr"
++            if (data[0] == '(')
++            {
++                int close = data.IndexOf(')');
++                if (close >= 0)
+                 {
+-                    files.Add(fileName);
++                    int s = close + 2;
++                    if (data.Contains("Extracting "))
++                        s += 11;
++                    if (s < data.Length)
++                        RecordFile(data.Substring(s));
+                 }
+-                //Trace.WriteLine(filename);
+             }
++
++            // detect addition, e.g. "added: records/foo.dbr"
++            int added = data.IndexOf("added: ", StringComparison.Ordinal);
++            if (added >= 0)
++                RecordFile(data.Substring(added + 7));
+         }
+     }
+ }
+diff --git a/GrimDawnModMerger/GrimDawnModMerger/GrimDawnModMerger.csproj b/GrimDawnModMerger/GrimDawnModMerger/GrimDawnModMerger.csproj
+index 1a318e9..a9ccd3f 100644
+--- a/GrimDawnModMerger/GrimDawnModMerger/GrimDawnModMerger.csproj
++++ b/GrimDawnModMerger/GrimDawnModMerger/GrimDawnModMerger.csproj
+@@ -1,16 +1,12 @@
+-﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
++﻿<Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+     <OutputType>WinExe</OutputType>
+-    <TargetFramework>netcoreapp3.1</TargetFramework>
++    <TargetFramework>net10.0-windows</TargetFramework>
+     <UseWPF>true</UseWPF>
+     <ApplicationIcon>MainIcon.ico</ApplicationIcon>
+   </PropertyGroup>
+ 
+-  <ItemGroup>
+-    <PackageReference Include="WindowsAPICodePack-Shell" Version="1.1.1" />
+-  </ItemGroup>
+-
+   <ItemGroup>
+     <Compile Update="Properties\Settings.Designer.cs">
+       <DesignTimeSharedInput>True</DesignTimeSharedInput>
+diff --git a/GrimDawnModMerger/GrimDawnModMerger/MainWindow.xaml.cs b/GrimDawnModMerger/GrimDawnModMerger/MainWindow.xaml.cs
+index 679468e..683e82e 100644
+--- a/GrimDawnModMerger/GrimDawnModMerger/MainWindow.xaml.cs
++++ b/GrimDawnModMerger/GrimDawnModMerger/MainWindow.xaml.cs
+@@ -1,4 +1,4 @@
+-﻿using Microsoft.WindowsAPICodePack.Dialogs;
++﻿using Microsoft.Win32;
+ using System;
+ using System.Collections.Generic;
+ using System.Collections.ObjectModel;
+@@ -23,8 +23,8 @@ namespace GrimDawnModMerger
+             this.DataContext = this;
+             merger = new Merger(UILogMessageHandler);
+ 
+-            string savedGameDir = @Properties.Settings.Default.gameDir;
+-            if (savedGameDir.Length > 0)
++            string savedGameDir = Properties.Settings.Default.gameDir;
++            if (!string.IsNullOrEmpty(savedGameDir))
+                 txtBoxGamePath.Text = savedGameDir;
+         }
+ 
+@@ -40,18 +40,16 @@ namespace GrimDawnModMerger
+ 
+         private void btnSelectPath_Click (object sender, RoutedEventArgs e)
+         {
+-            CommonOpenFileDialog dialog = new CommonOpenFileDialog();
+-            //dialog.InitialDirectory = "C:\\Users";
+-            dialog.IsFolderPicker = true;
+-            if (dialog.ShowDialog() == CommonFileDialogResult.Ok)
++            OpenFolderDialog dialog = new OpenFolderDialog();
++            if (dialog.ShowDialog() == true)
+             {
+-                txtBoxGamePath.Text = dialog.FileName;
++                txtBoxGamePath.Text = dialog.FolderName;
+             }
+         }
+ 
+         private void btnMerge_Click (object sender, RoutedEventArgs e)
+         {
+-            if (txtBoxMergeModName.Text.Length == 0)
++            if (string.IsNullOrWhiteSpace(txtBoxMergeModName.Text))
+                 return;
+ 
+             // get all active mods
+@@ -65,27 +63,46 @@ namespace GrimDawnModMerger
+                     Trace.WriteLine(item.Name + ", is checked: " + item.IsSelected);
+                 }
+             }
++            if (activeMods.Count == 0)
++            {
++                UILogMessageHandler(this, new UILogMessageEventArgs { Message = "Select at least one mod to merge." });
++                return;
++            }
++
+             btnMerge.Content = "MERGE IN\nPROGRESS";
+             btnMerge.IsEnabled = false;
+             activeMods.Reverse();
+-            merger.Merge(txtBoxMergeModName.Text, activeMods);
++            if (!merger.Merge(txtBoxMergeModName.Text, activeMods))
++            {
++                // merge was refused or could not start, give the button back
++                btnMerge.Content = "Merge";
++                btnMerge.IsEnabled = true;
++            }
+         }
+ 
+         private void txtBoxGamePath_TextChanged (object sender, TextChangedEventArgs e)
+         {
+-            merger.GAME_DIR = @txtBoxGamePath.Text;
++            // can fire while the window is still being constructed
++            if (merger == null || modList == null)
++                return;
++
++            merger.GAME_DIR = txtBoxGamePath.Text;
++            modList.Clear();
+ 
+             // scan new directory for mods
+             // TODO in future, save last configuration (isselected and position), as well as what mods were last merged
+-            DirectoryInfo dirInfo = new DirectoryInfo(merger.GAME_DIR + @"\mods");
+-            modList.Clear();
+-            foreach(DirectoryInfo d in dirInfo.GetDirectories())
++            string modsPath = Path.Combine(merger.GAME_DIR, "mods");
++            if (!Directory.Exists(modsPath))
++                return; // typing a path by hand, or the saved path no longer exists
++
++            DirectoryInfo dirInfo = new DirectoryInfo(modsPath);
++            foreach (DirectoryInfo d in dirInfo.GetDirectories())
+             {
+                 if (d.Name.Equals("gdx1") || d.Name.Equals("gdx2"))
+                     continue;
+                 modList.Add(new ModListItem(false, d.Name));
+             }
+-            Properties.Settings.Default.gameDir = @txtBoxGamePath.Text;
++            Properties.Settings.Default.gameDir = txtBoxGamePath.Text;
+             Properties.Settings.Default.Save();
+         }
+ 
+@@ -136,9 +153,10 @@ namespace GrimDawnModMerger
+ 
+             item = (ModListItem)listBoxMods.SelectedItems[0];
+             index = modList.IndexOf(item);
+-            if (index > 0)
++            int newIndex = index + delta;
++            if (index >= 0 && newIndex >= 0 && newIndex < modList.Count)
+             {
+-                modList.Move(index, index + delta);
++                modList.Move(index, newIndex);
+             }
+         }
+ 
+diff --git a/GrimDawnModMerger/GrimDawnModMerger/Merger.cs b/GrimDawnModMerger/GrimDawnModMerger/Merger.cs
+index 9f7988c..66912aa 100644
+--- a/GrimDawnModMerger/GrimDawnModMerger/Merger.cs
++++ b/GrimDawnModMerger/GrimDawnModMerger/Merger.cs
+@@ -1,24 +1,24 @@
+ ﻿using System;
+ using System.Collections.Generic;
+ using System.IO;
+-using System.Text;
+-using System.Diagnostics;
+-using System.Collections.ObjectModel;
+-using System.Runtime.CompilerServices;
+-using System.Threading;
+-using System.Windows.Threading;
++using System.Linq;
+ 
+ namespace GrimDawnModMerger
+ {
+     class Merger
+     {
++        // Written into every folder this tool creates. We only ever delete a pre-existing
++        // output folder if it carries this marker, so a typo can't wipe a real mod or the game.
++        private const string MarkerFileName = ".gdmm_merged";
++
+         public string GAME_DIR { get; set; }
+ 
+         private CommandLine cmdLine;
+-        //private Thread cmdThread; // TODO why is the merger handling the threading...
+-        private EventHandler<UILogMessageEventArgs> UILogMessageCallback;
++        private readonly EventHandler<UILogMessageEventArgs> UILogMessageCallback;
+ 
+-        private string currentMod; // !!DEBUG!!
++        private string currentMod;
++        private string combinedRoot;
++        private readonly List<string> rawOverwrites = new List<string>();
+ 
+         public Merger(EventHandler<UILogMessageEventArgs> UILogMessageCallback)
+         {
+@@ -31,91 +31,198 @@ namespace GrimDawnModMerger
+                 cmdLine.Kill(gracefully: false);
+         }
+ 
+-        public void Merge(string mergeName, List<string> modsToMerge)
++        private void Log(string message)
+         {
+-            cmdLine = new CommandLine(GAME_DIR, UILogMessageCallback);
+-            cmdLine.Start();
++            UILogMessageCallback?.Invoke(this, new UILogMessageEventArgs { Message = message });
++        }
+ 
+-            // for testing, wipe old combined dir
+-            string combinedDir = GAME_DIR + @"\mods\" + mergeName;
++        /// <returns>true if the merge was started, false if it was refused or failed to start.</returns>
++        public bool Merge(string mergeName, List<string> modsToMerge)
++        {
++            mergeName = (mergeName ?? "").Trim();
++
++            string modsRoot = Path.Combine(GAME_DIR ?? "", "mods");
++            if (!Directory.Exists(modsRoot))
++            {
++                Log("ERROR: no 'mods' folder found in the game directory.");
++                return false;
++            }
++            modsRoot = Path.GetFullPath(modsRoot);
+ 
+-            // kill archivetool if it is still running
+-            foreach (Process proc in Process.GetProcessesByName("ArchiveTool"))
++            string error = ValidateMergeName(mergeName, modsToMerge, modsRoot);
++            if (error != null)
+             {
+-                Trace.WriteLine("Killing archivetool...");
+-                proc.Kill();
++                Log("ERROR: " + error);
++                return false;
+             }
+ 
+-            SetupModDirectory(combinedDir);
++            string combinedDir = Path.Combine(modsRoot, mergeName);
++            combinedRoot = combinedDir;
+ 
+-            // merge mods
+-            foreach (string mod in modsToMerge)
++            try
++            {
++                SetupModDirectory(combinedDir);
++            }
++            catch (Exception e)
+             {
+-                currentMod = mod;
+-                string modDir = GAME_DIR + @"\mods\" + @mod;
+-                AddMod(modDir, combinedDir);
++                Log("ERROR: " + e.Message);
++                return false;
+             }
+ 
+-            // build .arz
+-            cmdLine.messageQueue.Add(new Message { Command = "BuildDatabase", Args = new string[] { combinedDir, GAME_DIR } });
+-            //cmdLine.messageQueue.Add(new Message { Command = "Close", Args = null });
+-            cmdLine.Kill();
++            Log("Merge order (each mod overrides the ones before it): " + string.Join(" -> ", modsToMerge));
++
++            cmdLine = new CommandLine(GAME_DIR, UILogMessageCallback);
++            cmdLine.Start();
++
++            try
++            {
++                rawOverwrites.Clear();
++                foreach (string mod in modsToMerge)
++                {
++                    currentMod = mod;
++                    AddMod(Path.Combine(modsRoot, mod), combinedDir);
++                }
++
++                if (rawOverwrites.Count > 0)
++                {
++                    Log("\nWARNING: " + rawOverwrites.Count + " loose file(s) were overwritten by a later mod:");
++                    foreach (string s in rawOverwrites.Take(50))
++                        Log("  " + s);
++                    if (rawOverwrites.Count > 50)
++                        Log("  ... and " + (rawOverwrites.Count - 50) + " more");
++                }
++
++                // build .arz
++                cmdLine.messageQueue.Add(new Message { Command = "BuildDatabase", Args = new string[] { combinedDir, GAME_DIR } });
++                cmdLine.Kill(); // graceful: runs everything queued, then closes
++                return true;
++            }
++            catch (Exception e)
++            {
++                Log("ERROR: merge aborted: " + e.Message);
++                cmdLine.Kill(gracefully: false);
++                return false;
++            }
++        }
++
++        private string ValidateMergeName(string mergeName, List<string> modsToMerge, string modsRoot)
++        {
++            if (mergeName.Length == 0)
++                return "Enter a name for the merged mod.";
++
++            if (mergeName.All(c => c == '.'))
++                return "'" + mergeName + "' is not a valid merge name.";
++
++            if (mergeName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
++                return "The merge name contains characters that are not allowed in a folder name.";
++
++            // belt and braces: the result must sit directly inside the mods folder
++            string full = Path.GetFullPath(Path.Combine(modsRoot, mergeName));
++            string parent = Path.GetDirectoryName(full);
++            if (!string.Equals(parent, modsRoot.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
++                return "The merge name must be a plain folder name.";
++
++            if (mergeName.Equals("gdx1", StringComparison.OrdinalIgnoreCase) ||
++                mergeName.Equals("gdx2", StringComparison.OrdinalIgnoreCase))
++                return "That name is reserved for an official expansion.";
++
++            if (modsToMerge.Any(m => m.Equals(mergeName, StringComparison.OrdinalIgnoreCase)))
++                return "The merge name is the same as one of the mods being merged. Pick a different name.";
++
++            return null;
+         }
+ 
+         private void AddMod(string modDir, string combinedDir)
+         {
+             // raw copy any resources
+             DirectoryCopy(modDir, combinedDir, true);
+-            DirectoryInfo dir = new DirectoryInfo(modDir + @"\resources");
+ 
+             // decompile any .arc or .arz into their respective folders
+-            foreach (FileInfo file in dir.GetFiles())
++            string resourcesDir = Path.Combine(modDir, "resources");
++            if (Directory.Exists(resourcesDir))
+             {
+-                if (file.Extension.Equals(".arc"))
++                foreach (FileInfo file in new DirectoryInfo(resourcesDir).GetFiles())
+                 {
+-                    ExtractArc(file, combinedDir + @"\source", cmdLine);
++                    if (IsExtension(file, ".arc"))
++                    {
++                        string baseName = Path.GetFileNameWithoutExtension(file.Name);
++                        ExtractArc(file, Path.Combine(combinedDir, "source"), cmdLine);
+ 
+-                    cmdLine.messageQueue.Add(new Message { Command = "Pack", Args = new string[] { combinedDir + @"\source\" + @file.Name.Substring(0, file.Name.Length - 4), @file.Name.Substring(0, file.Name.Length - 4), combinedDir + @"\resources\" + file.Name } });
++                        cmdLine.messageQueue.Add(new Message
++                        {
++                            Command = "Pack",
++                            Args = new string[]
++                            {
++                                Path.Combine(combinedDir, "source", baseName),
++                                baseName,
++                                Path.Combine(combinedDir, "resources", file.Name)
++                            }
++                        });
++                    }
+                 }
+             }
+-
+-            dir = new DirectoryInfo(modDir + @"\database");
+-
+-            foreach (FileInfo file in dir.GetFiles())
++            else
+             {
+-                if (file.Extension.Equals(".arz"))
+-                    ExtractArz(file, combinedDir + @"\database", cmdLine);
++                Log("Note: " + currentMod + " has no 'resources' folder, skipping its resource archives.");
++            }
+ 
+-                else if (file.Extension.Equals(".arc"))
+-                    ExtractArc(file, combinedDir + @"\database", cmdLine);
++            string databaseDir = Path.Combine(modDir, "database");
++            if (Directory.Exists(databaseDir))
++            {
++                foreach (FileInfo file in new DirectoryInfo(databaseDir).GetFiles())
++                {
++                    if (IsExtension(file, ".arz"))
++                        ExtractArz(file, Path.Combine(combinedDir, "database"), cmdLine);
++                    else if (IsExtension(file, ".arc"))
++                        ExtractArc(file, Path.Combine(combinedDir, "database"), cmdLine);
++                }
++            }
++            else
++            {
++                Log("Note: " + currentMod + " has no 'database' folder, skipping its database archives.");
+             }
+         }
+ 
++        private static bool IsExtension(FileInfo file, string extension)
++        {
++            return file.Extension.Equals(extension, StringComparison.OrdinalIgnoreCase);
++        }
++
+         private void ExtractArc(FileInfo file, string destination, CommandLine cmdLine) // TODO move this out of merger
+         {
+-            Directory.CreateDirectory(destination);// + @file.Name.Substring(0, file.Name.Length - 4));
++            Directory.CreateDirectory(destination);
+             cmdLine.messageQueue.Add(new Message { Command = "Extract", Args = new string[] { file.FullName, destination } });
+         }
+ 
+-        private void ExtractArz (FileInfo file, string destination, CommandLine cmdLine) // TODO move this out of merger
++        private void ExtractArz(FileInfo file, string destination, CommandLine cmdLine) // TODO move this out of merger
+         {
+-            Directory.CreateDirectory(destination);// + @file.Name.Substring(0, file.Name.Length - 4));
++            Directory.CreateDirectory(destination);
+             cmdLine.messageQueue.Add(new Message { Command = "ExtractDatabase", Args = new string[] { file.FullName, destination } });
+         }
+ 
+-        private void SetupModDirectory(string combinedDir) // TODO move this out of merger
++        private void SetupModDirectory(string combinedDir)
+         {
+             if (Directory.Exists(combinedDir))
++            {
++                if ((File.GetAttributes(combinedDir) & FileAttributes.ReparsePoint) != 0)
++                    throw new InvalidOperationException("'" + combinedDir + "' is a link/junction, refusing to delete it.");
++
++                if (!File.Exists(Path.Combine(combinedDir, MarkerFileName)))
++                    throw new InvalidOperationException(
++                        "The folder '" + combinedDir + "' already exists and was not created by this tool, so it will not be deleted. " +
++                        "Choose a different merge name, or delete that folder yourself if you are sure it is an old merge.");
++
+                 Directory.Delete(combinedDir, true);
++            }
+ 
+             Directory.CreateDirectory(combinedDir);
+-            Directory.CreateDirectory(combinedDir + @"\source");
+-            Directory.CreateDirectory(combinedDir + @"\database\templates");
++            Directory.CreateDirectory(Path.Combine(combinedDir, "source"));
++            Directory.CreateDirectory(Path.Combine(combinedDir, "database", "templates"));
++            File.WriteAllText(Path.Combine(combinedDir, MarkerFileName), "Created by Grim Dawn Mod Merger. Safe to delete/overwrite.");
+         }
+ 
+-        private void DirectoryCopy (string sourceDirName, string destDirName, bool copySubDirs)  // TODO move this out of merger
++        private void DirectoryCopy(string sourceDirName, string destDirName, bool copySubDirs) // TODO move this out of merger
+         {
+-            // Get the subdirectories for the specified directory.
+             DirectoryInfo dir = new DirectoryInfo(sourceDirName);
+ 
+             if (!dir.Exists)
+@@ -127,28 +234,24 @@ namespace GrimDawnModMerger
+ 
+             DirectoryInfo[] dirs = dir.GetDirectories();
+ 
+-            // If the destination directory doesn't exist, create it.       
+             Directory.CreateDirectory(destDirName);
+ 
+-            // Get the files in the directory and copy them to the new location.
+-            FileInfo[] files = dir.GetFiles();
+-            foreach (FileInfo file in files)
++            foreach (FileInfo file in dir.GetFiles())
+             {
+-                if (file.Extension.Equals(".arz") || file.Extension.Equals(".arc"))
++                if (IsExtension(file, ".arz") || IsExtension(file, ".arc"))
+                     continue;
+ 
+                 string tempPath = Path.Combine(destDirName, file.Name);
+-                try
+-                {
+-                    file.CopyTo(tempPath, false);
+-                } catch (Exception e)
++                if (File.Exists(tempPath))
+                 {
+-                    Trace.WriteLine(currentMod + " is overwriting " + file.Name);
+-                    file.CopyTo(tempPath, true);
++                    string relative = tempPath.StartsWith(combinedRoot, StringComparison.OrdinalIgnoreCase)
++                        ? tempPath.Substring(combinedRoot.Length).TrimStart(Path.DirectorySeparatorChar)
++                        : tempPath;
++                    rawOverwrites.Add(currentMod + " overwrote " + relative);
+                 }
++                file.CopyTo(tempPath, true);
+             }
+ 
+-            // If copying subdirectories, copy them and their contents to new location.
+             if (copySubDirs)
+             {
+                 foreach (DirectoryInfo subdir in dirs)
